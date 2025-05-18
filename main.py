@@ -701,4 +701,274 @@ async def cancel_poster_creation(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_keyboard(is_driver=is_driver)
     )
 
+@dp.message(F.text == "🔍 Ёфтани Нақлиёт")
+async def find_rides(message: Message):
+    """Display available rides"""
+    posters = db.get_active_posters()
     
+    if not posters:
+        await message.answer(
+            "Айни ҳол ягон сафари фаъол мавҷуд нест.\n"
+            "Лутфан дертар бинед ё огоҳиҳо гиред вақте ки сафари нав пайдо мешавад."
+        )
+        return
+    
+    for poster in posters:
+        ride_time = format_datetime(poster['time_to_go'])
+        
+        driver_name = f"{poster['first_name']} {poster['last_name'] or ''}"
+        
+        car_photo = poster.get('car_photo')
+        
+        message_text = (
+            f"🚗 Сафар аз {poster['from_location']} то {poster['to_location']}\n"
+            f"🕒 Вақт: {ride_time}\n"
+            f"💰 Нарх: {poster['price']} сомонӣ\n"
+            f"💺 Ҷойҳои холӣ: {poster['seat_count']}\n"
+            f"🧳 Вазни бор (як кас): {poster['bags_count']}\n"
+            f"👨‍✈️ Ронанда: {driver_name}\n"
+            f"🚘 Мошин: {poster['car_model']}"
+        )
+        
+        if car_photo and os.path.exists(car_photo):
+            await message.answer_photo(
+                FSInputFile(car_photo),
+                caption=message_text,
+                reply_markup=get_poster_inline_keyboard(poster['id'])
+            )
+        else:
+            await message.answer(
+                message_text,
+                reply_markup=get_poster_inline_keyboard(poster['id'])
+            )
+
+@dp.message(F.text == "🚗 Сафарҳои Ман")
+async def my_rides(message: Message):
+    """Display driver's rides"""
+    user = db.get_user(message.from_user.id)
+    if not user:
+        await message.answer("Лутфан, аввал ба қайд гиред. Барои оғоз /start-ро пахш кунед.")
+        return
+    
+    driver = db.get_driver_by_user_id(user['id'])
+    if not driver:
+        await message.answer(
+            "Шумо ҳанӯз ҳамчун ронанда ба қайд гирифта нашудаед.",
+            reply_markup=get_main_keyboard(is_driver=False)
+        )
+        return
+    
+    posters = db.get_driver_posters(driver['id'])
+    
+    if not posters:
+        await message.answer(
+            "Шумо ҳанӯз ягон сафар эълон накардаед.\n"
+            "Барои эълон кардани сафари нав, тугмаи «Эълон Кардани Сафари Нав»-ро пахш кунед."
+        )
+        return
+    
+    for poster in posters:
+        ride_time = format_datetime(poster['time_to_go'])
+        
+        status = "🟢 Фаъол" if poster['is_active'] else "🔴 Ғайри фаъол"
+        orders = f"👥 Бронҳо: {poster['order_count']}"
+        
+        message_text = (
+            f"🚗 Сафар аз {poster['from_location']} то {poster['to_location']}\n"
+            f"🕒 Вақт: {ride_time}\n"
+            f"💰 Нарх: {poster['price']} сомонӣ\n"
+            f"💺 Ҷойҳои холӣ: {poster['seat_count']}\n"
+            f"🧳 Вазни бор (як кас): {poster['bags_count']}\n"
+            f"{status} • {orders}"
+        )
+        
+        await message.answer(
+            message_text,
+            reply_markup=get_my_ride_keyboard(poster['id'])
+        )
+
+
+@dp.callback_query(F.data.startswith("book_")) 
+async def book_ride(callback: CallbackQuery, state: FSMContext):
+    """Handle ride booking"""
+    poster_id = int(callback.data.split("_")[1])
+    
+    poster = db.get_poster_by_id(poster_id)
+    if not poster or not poster['is_active']:
+        await callback.message.answer("Ин сафар дигар дастрас нест.")
+        await callback.answer("Сафар дастрас нест")
+        return
+    
+    await state.update_data(poster_id=poster_id)
+    
+    await callback.message.answer(
+        f"Шумо сафарро интихоб кардед аз {poster['from_location']} то {poster['to_location']}.\n"
+        f"Чанд ҷой брон мекунед? (максимум {poster['seat_count']} ҷой):"
+    )
+    
+    await state.set_state(BookRide.seats)
+    await callback.answer()
+
+@dp.message(BookRide.seats)
+async def process_booking_seats(message: Message, state: FSMContext):
+    """Process booking seats"""
+    try:
+        seats = int(message.text)
+        data = await state.get_data()
+        poster_id = data['poster_id']
+        
+        poster = db.get_poster_by_id(poster_id)
+        if not poster or not poster['is_active']:
+            await message.answer("Ин сафар дигар дастрас нест.")
+            await state.clear()
+            return
+        
+        if seats <= 0:
+            await message.answer("Лутфан шумораи мусбати ҷойҳоро ворид кунед.")
+            return
+            
+        if seats > poster['seat_count']:
+            await message.answer(
+                f"Дар сафар танҳо {poster['seat_count']} ҷой мавҷуд аст.\n"
+                f"Лутфан камтар ҷой интихоб кунед:"
+            )
+            return
+        
+        await state.update_data(seats=seats)
+        
+        if poster['bags_count'] > 0:
+            await message.answer(
+                f"Вазни тахминии бағоҷи худро бо килограмм ворид кунед (0 агар бағоҷ надоред):"
+            )
+            await state.set_state(BookRide.baggage)
+        else:
+            await state.update_data(baggage=0)
+            
+            ride_time = format_datetime(poster['time_to_go'])
+            
+            await message.answer(
+                "Лутфан брони худро тасдиқ кунед:\n\n"
+                f"🚏 Аз: {poster['from_location']}\n"
+                f"🏁 Ба: {poster['to_location']}\n"
+                f"🕒 Вақт: {ride_time}\n"
+                f"💰 Нарх: {poster['price'] * seats} сомонӣ ({poster['price']} × {seats})\n"
+                f"💺 Ҷойҳо: {seats}\n"
+                f"🧳 Бор: Не\n"
+                f"👨‍✈️ Ронанда: {poster['first_name']} {poster['last_name'] or ''}",
+                reply_markup=get_confirm_booking_keyboard()
+            )
+            
+            await state.set_state(BookRide.confirm)
+            
+    except ValueError:
+        await message.answer("Лутфан рақами дурустро ворид кунед:")
+
+@dp.message(BookRide.baggage)
+async def process_baggage(message: Message, state: FSMContext):
+    """Process baggage information"""
+    try:
+        baggage = int(message.text)
+        if baggage < 0:
+            await message.answer("Лутфан рақами мусбатро ворид кунед:")
+            return
+        
+        data = await state.get_data()
+        poster_id = data['poster_id']
+        seats = data['seats']
+        
+        poster = db.get_poster_by_id(poster_id)
+        if not poster:
+            await message.answer("Ин сафар дигар дастрас нест.")
+            await state.clear()
+            return
+        
+        await state.update_data(baggage=baggage)
+        
+        ride_time = format_datetime(poster['time_to_go'])
+        
+        await message.answer(
+            "Лутфан брони худро тасдиқ кунед:\n\n"
+            f"🚏 Аз: {poster['from_location']}\n"
+            f"🏁 Ба: {poster['to_location']}\n"
+            f"🕒 Вақт: {ride_time}\n"
+            f"💰 Нарх: {poster['price'] * seats} сомонӣ ({poster['price']} × {seats})\n"
+            f"💺 Ҷойҳо: {seats}\n"
+            f"🧳 Бор: {baggage} кг\n"
+            f"👨‍✈️ Ронанда: {poster['first_name']} {poster['last_name'] or ''}",
+            reply_markup=get_confirm_booking_keyboard()
+        )
+        
+        await state.set_state(BookRide.confirm)
+    except ValueError:
+        await message.answer("Лутфан рақами дурустро ворид кунед:")
+
+@dp.callback_query(F.data == "confirm_booking", BookRide.confirm)
+async def confirm_booking(callback: CallbackQuery, state: FSMContext):
+    """Confirm booking"""
+    user_id = callback.from_user.id
+    db_user = db.get_user(user_id)
+    
+    if not db_user:
+        await callback.message.answer("Лутфан аввал бақайдгирӣ гузаред.")
+        await callback.answer()
+        return
+    
+    data = await state.get_data()
+    poster_id = data['poster_id']
+    seats = data['seats']
+    baggage = data.get('baggage', 0)
+    
+    try:
+        order_id = db.create_order(poster_id, db_user['id'], seats, baggage)
+        
+        poster = db.get_poster_by_id(poster_id)
+        
+        await callback.message.answer(
+            "✅ Брони шумо тасдиқ карда шуд!\n\n"
+            f"🔢 Рақами брон: #{order_id}\n"
+            f"🚏 Аз: {poster['from_location']}\n"
+            f"🏁 Ба: {poster['to_location']}\n"
+            f"🕒 Вақт: {format_datetime(poster['time_to_go'])}\n"
+            f"💰 Нарх: {poster['price'] * seats} сомонӣ\n"
+            f"💺 Ҷойҳо: {seats}\n"
+            f"🧳 Бор: {baggage} кг\n\n"
+            f"👨‍✈️ Ронанда: {poster['first_name']} {poster['last_name'] or ''}\n"
+            f"📞 Телефон: {poster['phone_number']}\n\n"
+            "Шумо метавонед бо истифода аз менюи асосӣ брони худро дида бароед ва бо ронанда тамос гиред.",
+            reply_markup=get_main_keyboard()
+        )
+        
+        driver_telegram_id = None
+        try:
+            driver_user = db.get_user_by_id(poster['user_id'])
+            if driver_user:
+                driver_telegram_id = driver_user['telegram_id']
+                
+                if driver_telegram_id:
+                    await bot.send_message(
+                        driver_telegram_id,
+                        f"🆕 Брони нав барои сафари шумо:\n\n"
+                        f"🚏 Аз: {poster['from_location']}\n"
+                        f"🏁 Ба: {poster['to_location']}\n"
+                        f"🕒 Вақт: {format_datetime(poster['time_to_go'])}\n"
+                        f"👤 Мусофир: {callback.from_user.full_name}\n"
+                        f"💺 Ҷойҳо: {seats}\n"
+                        f"🧳 Бор: {baggage} кг\n\n"
+                        "Барои дидани маълумоти пурра, ба 'Сафарҳои ман' ворид шавед."
+                    )
+        except Exception as e:
+            logging.error(f"Error notifying driver: {e}")
+        
+        await state.clear()
+    except Exception as e:
+        logging.error(f"Error creating order: {e}")
+        await callback.message.answer("Хатогӣ ҳангоми брон. Лутфан боз кӯшиш кунед.")
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel_booking", BookRide.confirm)
+async def cancel_booking_process(callback: CallbackQuery, state: FSMContext):
+    """Cancel booking process"""
+    await callback.message.answer("Брон бекор карда шуд.", reply_markup=get_main_keyboard())
+    await state.clear()
+    await callback.answer()
