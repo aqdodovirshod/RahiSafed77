@@ -272,3 +272,433 @@ async def show_notifications(message: Message):
 def format_datetime(dt_str):
     time_obj = datetime.fromisoformat(dt_str)
     return time_obj.strftime("%d %b %Y, %H:%M")
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    """Handle the /start command"""
+    user = db.get_user(message.from_user.id)
+    
+    if not user:
+        user_id = db.create_user(
+            telegram_id=message.from_user.id,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name
+        )
+        await message.answer(
+            f"Салом, {message.from_user.first_name}! Хуш омадед ба боти саёҳат.\n"
+            f"Барои идома додан, лутфан рақами телефони худро пешниҳод кунед.",
+            reply_markup=get_phone_keyboard()
+        )
+        await state.set_state(Registration.phone_number)
+    else:
+        driver = db.get_driver_by_user_id(user['id'])
+        is_driver = driver is not None
+        
+        await message.answer(
+            f"Салом, {user['first_name']}! Шумо чӣ кор кардан мехоҳед?",
+            reply_markup=get_main_keyboard(is_driver)
+        )
+
+@dp.message(Registration.phone_number)
+async def process_phone(message: Message, state: FSMContext):
+    """Process the phone number from the user"""
+    if message.contact and message.contact.phone_number:
+        db.update_user_phone(message.from_user.id, message.contact.phone_number)
+        
+        await state.clear()
+        await message.answer(
+            "Раҳмат! Шумо бомуваффақият ба қайд гирифта шудед.",
+            reply_markup=get_main_keyboard(is_driver=False)
+        )
+    else:
+        await message.answer(
+            "Лутфан, тугмаи «Фиристодани рақами телефон»-ро пахш кунед.",
+            reply_markup=get_phone_keyboard()
+        )
+
+@dp.message(F.text == "🚗 Ронанда Шудан")
+async def become_driver(message: Message, state: FSMContext):
+    """Handle driver registration initiation"""
+    user = db.get_user(message.from_user.id)
+    
+    if not user:
+        await message.answer(
+            "Лутфан, аввал ба қайд гиред. Барои оғоз /start -ро пахш кунед."
+        )
+        return
+    
+    driver = db.get_driver_by_user_id(user['id'])
+    if driver:
+        await message.answer(
+            "Шумо аллакай ҳамчун ронанда ба қайд гирифта шудаед!",
+            reply_markup=get_main_keyboard(is_driver=True)
+        )
+        return
+    
+    await message.answer(
+        "Барои ба қайд гирифтан ҳамчун ронанда, лутфан чанд соли таҷрибаи ронандагӣ доред?",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(DriverRegistration.experience)
+
+@dp.message(DriverRegistration.experience)
+async def process_experience(message: Message, state: FSMContext):
+    """Process driver experience"""
+    try:
+        experience = int(message.text)
+        if experience < 0:
+            raise ValueError("Experience cannot be negative")
+            
+        await state.update_data(experience=experience)
+        await message.answer("Лутфан рақами қайди мошинатонро ворид кунед:")
+        await state.set_state(DriverRegistration.car_license)
+    except ValueError:
+        await message.answer("Лутфан рақами дурустро ворид кунед:")
+
+@dp.message(DriverRegistration.car_license)
+async def process_car_license(message: Message, state: FSMContext):
+    """Process car license"""
+    await state.update_data(car_license=message.text)
+    await message.answer("Лутфан модели мошинатонро ворид кунед:")
+    await state.set_state(DriverRegistration.car_model)
+
+@dp.message(DriverRegistration.car_model)
+async def process_car_model(message: Message, state: FSMContext):
+    """Process car model"""
+    await state.update_data(car_model=message.text)
+    await message.answer("Лутфан соли истеҳсоли мошинатонро ворид кунед:")
+    await state.set_state(DriverRegistration.car_year)
+
+@dp.message(DriverRegistration.car_year)
+async def process_car_year(message: Message, state: FSMContext):
+    """Process car year"""
+    try:
+        car_year = int(message.text)
+        current_year = datetime.now().year
+        
+        if car_year < 1900 or car_year > current_year:
+            raise ValueError("Invalid year")
+            
+        await state.update_data(car_year=car_year)
+        await message.answer("Лутфан рақами шиносномаи мошинро ворид кунед:")
+        await state.set_state(DriverRegistration.car_id)
+    except ValueError:
+        await message.answer(f"Лутфан соли дурустро ворид кунед (1900-{datetime.now().year}):")
+
+@dp.message(DriverRegistration.car_id)
+async def process_car_id(message: Message, state: FSMContext):
+    """Process car ID"""
+    await state.update_data(car_id=message.text)
+    await message.answer("Лутфан акси мошинатонро фиристед:")
+    await state.set_state(DriverRegistration.car_photo)
+
+@dp.message(DriverRegistration.car_photo)
+async def process_car_photo(message: Message, state: FSMContext):
+    """Process car photo"""
+    user = db.get_user(message.from_user.id)
+    if not user:
+        await message.answer("Хатогӣ рӯй дод. Лутфан /start-ро пахш кунед.")
+        await state.clear()
+        return
+    
+    if not message.photo:
+        await message.answer("Лутфан, акси мошинро фиристед.")
+        return
+    
+    photo = message.photo[-1]
+    photo_path = f"car_photos/car_{user['id']}_{message.from_user.id}.jpg"
+    
+    await bot.download(photo, destination=photo_path)
+    
+    data = await state.get_data()
+    
+    driver_id = db.register_driver(
+        user['id'],
+        data['experience'],
+        data['car_license'],
+        data['car_model'],
+        data['car_year'],
+        data['car_id'],
+        photo_path
+    )
+    
+    await state.clear()
+    await message.answer(
+        "Табрик! Шумо ҳамчун ронанда бомуваффақият ба қайд гирифта шудед.\n"
+        "Акнун шумо метавонед сафарҳо эълон кунед ва мусофиронро қабул кунед.",
+        reply_markup=get_main_keyboard(is_driver=True)
+    )
+
+@dp.message(F.text == "➕ Эълон Кардани Сафари Нав")
+async def post_new_ride(message: Message, state: FSMContext):
+    """Handler for posting a new ride"""
+    user = db.get_user(message.from_user.id)
+    if not user:
+        await message.answer("Лутфан, аввал ба қайд гиред. Барои оғоз /start-ро пахш кунед.")
+        return
+    
+    driver = db.get_driver_by_user_id(user['id'])
+    if not driver:
+        await message.answer(
+            "Барои эълон кардани сафар, шумо бояд аввал ҳамчун ронанда ба қайд гирифта шавед.",
+            reply_markup=get_main_keyboard(is_driver=False)
+        )
+        return
+    
+    await message.answer(
+        "Аз куҷо сафарро оғоз мекунед? (шаҳр ё ҷойро ворид кунед)",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(PostRide.from_location)
+
+@dp.message(PostRide.from_location)
+async def process_from_location(message: Message, state: FSMContext):
+    """Process departure location"""
+    await state.update_data(from_location=message.text)
+    await message.answer(
+        "Лутфан макони дақиқи оғози сафарро дар харита нишон диҳед (ихтиёрӣ):",
+        reply_markup=get_skip_location_keyboard()
+    )
+    await state.set_state(PostRide.from_location_map)
+
+@dp.message(PostRide.from_location_map)
+async def process_from_location_map(message: Message, state: FSMContext):
+    """Process departure location map coordinates"""
+    if message.text == "⏭️ Пропустить":
+        await state.update_data(from_latitude=None, from_longitude=None)
+        await message.answer("Ба куҷо сафар мекунед? (шаҳр ё ҷойро ворид кунед)")
+        await state.set_state(PostRide.to_location)
+        return
+    
+    if not message.location:
+        await message.answer(
+            "Лутфан локатсияро бо тугмаи зерин фиристед ё 'Пропустить'-ро пахш кунед:",
+            reply_markup=get_skip_location_keyboard()
+        )
+        return
+    
+    await state.update_data(
+        from_latitude=message.location.latitude,
+        from_longitude=message.location.longitude
+    )
+    
+    await message.answer("Ба куҷо сафар мекунед? (шаҳр ё ҷойро ворид кунед)")
+    await state.set_state(PostRide.to_location)
+
+@dp.message(PostRide.to_location)
+async def process_to_location(message: Message, state: FSMContext):
+    """Process destination location"""
+    await state.update_data(to_location=message.text)
+    await message.answer(
+        "Лутфан макони дақиқи анҷоми сафарро дар харита нишон диҳед (ихтиёрӣ):",
+        reply_markup=get_skip_location_keyboard()
+    )
+    await state.set_state(PostRide.to_location_map)
+
+@dp.message(PostRide.to_location_map)
+async def process_to_location_map(message: Message, state: FSMContext):
+    """Process destination location map coordinates"""
+    if message.text == "⏭️ Пропустить":
+        await state.update_data(to_latitude=None, to_longitude=None)
+        await message.answer(
+            "Санаи сафарро ворид кунед (дар формати ДД.ММ.СССС, масалан 25.05.2025):"
+        )
+        await state.set_state(PostRide.date)
+        return
+    
+    if not message.location:
+        await message.answer(
+            "Лутфан локатсияро бо тугмаи зерин фиристед ё 'Пропустить'-ро пахш кунед:",
+            reply_markup=get_skip_location_keyboard()
+        )
+        return
+    
+    await state.update_data(
+        to_latitude=message.location.latitude,
+        to_longitude=message.location.longitude
+    )
+    
+    await message.answer(
+        "Санаи сафарро ворид кунед (дар формати ДД.ММ.СССС, масалан 25.05.2025):"
+    )
+    await state.set_state(PostRide.date)
+
+@dp.message(PostRide.date)
+async def process_date(message: Message, state: FSMContext):
+    """Process ride date"""
+    date_pattern = r"^\d{2}\.\d{2}\.\d{4}$"
+    if not re.match(date_pattern, message.text):
+        await message.answer(
+            "Формати сана нодуруст аст. Лутфан дар шакли ДД.ММ.СССС ворид кунед, масалан 25.05.2025:"
+        )
+        return
+    
+    try:
+        day, month, year = map(int, message.text.split('.'))
+        if not (1 <= day <= 31 and 1 <= month <= 12 and 2023 <= year <= 2030):
+            raise ValueError("Invalid date range")
+            
+        await state.update_data(ride_date=message.text)
+        await message.answer(
+            "Вақти сафарро ворид кунед (дар формати СС:ДД, масалан 09:30):"
+        )
+        await state.set_state(PostRide.time)
+    except ValueError:
+        await message.answer(
+            "Санаи нодуруст. Лутфан санаи дурустро ворид кунед:"
+        )
+
+@dp.message(PostRide.time)
+async def process_time(message: Message, state: FSMContext):
+    """Process ride time"""
+    time_pattern = r"^\d{1,2}:\d{2}$"
+    if not re.match(time_pattern, message.text):
+        await message.answer(
+            "Формати вақт нодуруст аст. Лутфан дар шакли СС:ДД ворид кунед, масалан 09:30:"
+        )
+        return
+    
+    try:
+        hours, minutes = map(int, message.text.split(':'))
+        if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+            raise ValueError("Invalid time")
+            
+        await state.update_data(ride_time=message.text)
+        
+        await message.answer("Нархи сафарро ба сомонӣ ворид кунед:")
+        await state.set_state(PostRide.price)
+    except ValueError:
+        await message.answer("Вақти нодуруст. Лутфан вақти дурустро ворид кунед:")
+
+@dp.message(PostRide.price)
+async def process_price(message: Message, state: FSMContext):
+    """Process ride price"""
+    try:
+        price = float(message.text)
+        if price <= 0:
+            raise ValueError("Price must be positive")
+            
+        await state.update_data(price=price)
+        await message.answer("Шумораи ҷойҳои озодро ворид кунед:")
+        await state.set_state(PostRide.seats)
+    except ValueError:
+        await message.answer("Лутфан нархи дуруст ворид кунед (рақам):")
+
+@dp.message(PostRide.seats)
+async def process_seats(message: Message, state: FSMContext):
+    """Process available seats"""
+    try:
+        seats = int(message.text)
+        if seats <= 0:
+            raise ValueError("Seats must be positive")
+            
+        await state.update_data(seats=seats)
+        await message.answer("Шумораи максималии ҷойҳо барои борҳоро ворид кунед:")
+        await state.set_state(PostRide.bags)
+    except ValueError:
+        await message.answer("Лутфан шумораи дурусти ҷойҳоро ворид кунед (рақами бутун):")
+
+@dp.message(PostRide.bags)
+async def process_bags(message: Message, state: FSMContext):
+    """Process baggage capacity"""
+    try:
+        bags = int(message.text)
+        if bags < 0:
+            raise ValueError("Baggage count cannot be negative")
+            
+        await state.update_data(bags=bags)
+        
+        data = await state.get_data()
+        
+        date_str = data['ride_date']
+        time_str = data['ride_time']
+        day, month, year = map(int, date_str.split('.'))
+        hour, minute = map(int, time_str.split(':'))
+        
+        confirmation_text = (
+            "Лутфан маълумотро тасдиқ кунед:\n\n"
+            f"🚏 Аз: {data['from_location']}\n"
+            f"🏁 Ба: {data['to_location']}\n"
+            f"🕒 Вақт: {date_str} {time_str}\n"
+            f"💰 Нарх: {data['price']} сомонӣ\n"
+            f"💺 Ҷойҳои холӣ: {data['seats']}\n"
+            f"🧳 Вазни бор (як кас): {data['bags']}"
+        )
+        
+        await message.answer(confirmation_text, reply_markup=get_confirm_poster_keyboard())
+        await state.set_state(PostRide.confirm)
+    except ValueError:
+        await message.answer("Лутфан шумораи дурусти борҳоро ворид кунед (рақами бутун):")
+
+@dp.callback_query(PostRide.confirm, F.data == "confirm_poster")
+async def confirm_poster(callback: CallbackQuery, state: FSMContext):
+    """Handle poster confirmation"""
+    user = db.get_user(callback.from_user.id)
+    if not user:
+        await callback.message.answer("Хатогӣ рӯй дод. Лутфан /start-ро пахш кунед.")
+        await callback.answer()
+        await state.clear()
+        return
+    
+    driver = db.get_driver_by_user_id(user['id'])
+    if not driver:
+        await callback.message.answer("Шумо бояд аввал ҳамчун ронанда ба қайд гирифта шавед.")
+        await callback.answer()
+        await state.clear()
+        return
+    
+    data = await state.get_data()
+    
+    date_str = data['ride_date']
+    time_str = data['ride_time']
+    day, month, year = map(int, date_str.split('.'))
+    hour, minute = map(int, time_str.split(':'))
+    
+    time_to_go = datetime(year, month, day, hour, minute).isoformat()
+    
+    poster_id = db.create_poster(
+        driver_id=driver['id'],
+        from_location=data['from_location'],
+        to_location=data['to_location'],
+        price=data['price'],
+        seat_count=data['seats'],
+        time_to_go=time_to_go,
+        bags_count=data['bags'],
+        from_latitude=data.get('from_latitude'),
+        from_longitude=data.get('from_longitude'),
+        to_latitude=data.get('to_latitude'),
+        to_longitude=data.get('to_longitude')
+    )
+    
+    await callback.message.edit_text(
+        "✅ Сафари шумо бомуваффақият эълон карда шуд!\n\n"
+        "Шумо метавонед онро дар қисмати «Сафарҳои Ман» бинед."
+    )
+    
+    await callback.answer("Сафар бомуваффақият эълон карда шуд!")
+    await state.clear()
+    
+    await callback.message.answer(
+        "Шумо чӣ кор кардан мехоҳед?",
+        reply_markup=get_main_keyboard(is_driver=True)
+    )
+
+@dp.callback_query(PostRide.confirm, F.data == "cancel_poster")
+async def cancel_poster_creation(callback: CallbackQuery, state: FSMContext):
+    """Handle poster cancellation"""
+    await callback.message.edit_text("❌ Эълони сафар бекор карда шуд.")
+    await callback.answer("Эълони сафар бекор карда шуд")
+    await state.clear()
+    
+    user = db.get_user(callback.from_user.id)
+    is_driver = False
+    if user:
+        driver = db.get_driver_by_user_id(user['id'])
+        is_driver = driver is not None
+    
+    await callback.message.answer(
+        "Шумо чӣ кор кардан мехоҳед?",
+        reply_markup=get_main_keyboard(is_driver=is_driver)
+    )
+
+    
