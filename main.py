@@ -1422,3 +1422,427 @@ async def process_new_price(message: Message, state: FSMContext):
             
     except ValueError:
         await message.answer("❌ Лутфан қимати рақамиро ворид кунед:")
+
+@dp.callback_query(F.data == "edit_seats", EditRide.waiting_for_field)
+async def edit_seats_start(callback: CallbackQuery, state: FSMContext):
+    """Start editing seat count"""
+    await callback.message.answer("Лутфан шумораи нави ҷойҳоро ворид кунед:")
+    await state.set_state(EditRide.new_seats)
+    await callback.answer()
+
+@dp.message(EditRide.new_seats)
+async def process_new_seats(message: Message, state: FSMContext):
+    """Process new seat count for ride"""
+    try:
+        new_seats = int(message.text.strip())
+        
+        if new_seats <= 0:
+            await message.answer("❌ Шумораи ҷойҳо бояд аз 0 зиёд бошад. Лутфан аз нав ворид кунед:")
+            return
+        
+        data = await state.get_data()
+        poster_id = data.get("edit_poster_id")
+        
+        if not poster_id:
+            await message.answer("Хатогӣ. Лутфан аз нав кӯшиш кунед.")
+            await state.clear()
+            return
+        
+        poster = db.get_poster_by_id(poster_id)
+        orders = db.get_poster_orders(poster_id)
+        booked_seats = sum(order['seat_count'] for order in orders if order['is_active'])
+        
+        if new_seats < booked_seats:
+            await message.answer(f"❌ Шумо наметавонед шумораи ҷойҳоро камтар аз ҷойҳои банд кардашуда ({booked_seats}) кунед.")
+            return
+        
+        success = db.update_poster(poster_id, seat_count=new_seats)
+        
+        if success:
+            db.create_notification_for_ride_changes(
+                poster_id, 
+                f"Шумораи ҷойҳо тағйир дода шуд. Ҷойҳои нав: {new_seats}"
+            )
+            
+            if not poster['is_active'] and new_seats > 0:
+                db.update_poster(poster_id, is_active=True)
+            
+            await message.answer("✅ Шумораи ҷойҳо бо муваффақият тағйир дода шуд.")
+            await edit_ride_menu(callback=SimpleNamespace(
+                data=f"edit_ride_{poster_id}", 
+                message=message,
+                from_user=message.from_user,
+                answer=lambda: None
+            ), state=state)
+        else:
+            await message.answer("❌ Хатогӣ ҳангоми тағйир додани шумораи ҷойҳо. Лутфан аз нав кӯшиш кунед.")
+            
+    except ValueError:
+        await message.answer("❌ Лутфан рақами бутунро ворид кунед:")
+
+@dp.callback_query(F.data == "edit_bags", EditRide.waiting_for_field)
+async def edit_bags_start(callback: CallbackQuery, state: FSMContext):
+    """Start editing bag count"""
+    await callback.message.answer("Лутфан шумораи нави бағоҷро ворид кунед:")
+    await state.set_state(EditRide.new_bags)
+    await callback.answer()
+
+@dp.message(EditRide.new_bags)
+async def process_new_bags(message: Message, state: FSMContext):
+    """Process new bag count for ride"""
+    try:
+        new_bags = int(message.text.strip())
+        
+        if new_bags < 0:
+            await message.answer("❌ Шумораи бағоҷ наметавонад манфӣ бошад. Лутфан аз нав ворид кунед:")
+            return
+        
+        data = await state.get_data()
+        poster_id = data.get("edit_poster_id")
+        
+        if not poster_id:
+            await message.answer("Хатогӣ. Лутфан аз нав кӯшиш кунед.")
+            await state.clear()
+            return
+        
+        success = db.update_poster(poster_id, bags_count=new_bags)
+        
+        if success:
+            db.create_notification_for_ride_changes(
+                poster_id, 
+                f"Шумораи иҷозатдодашудаи бағоҷ тағйир дода шуд. Шумораи нав: {new_bags}"
+            )
+            
+            await message.answer("✅ Шумораи бағоҷ бо муваффақият тағйир дода шуд.")
+            await edit_ride_menu(callback=SimpleNamespace(
+                data=f"edit_ride_{poster_id}", 
+                message=message,
+                from_user=message.from_user,
+                answer=lambda: None
+            ), state=state)
+        else:
+            await message.answer("❌ Хатогӣ ҳангоми тағйир додани шумораи бағоҷ. Лутфан аз нав кӯшиш кунед.")
+            
+    except ValueError:
+        await message.answer("❌ Лутфан рақами бутунро ворид кунед:")
+
+@dp.callback_query(F.data == "cancel_ride", EditRide.waiting_for_field)
+async def cancel_ride_confirm(callback: CallbackQuery, state: FSMContext):
+    """Confirm ride cancellation"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Ҳа", callback_data="confirm_cancel_ride"),
+            InlineKeyboardButton(text="❌ Не", callback_data="cancel_cancel_ride")
+        ]
+    ])
+    
+    await callback.message.answer(
+        "⚠️ Оё шумо дар ҳақиқат мехоҳед ин сафарро бекор кунед? "
+        "Ҳамаи бронҳои мавҷуда бекор карда мешаванд.",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "confirm_cancel_ride")
+async def cancel_ride_process(callback: CallbackQuery, state: FSMContext):
+    """Process ride cancellation"""
+    data = await state.get_data()
+    poster_id = data.get("edit_poster_id")
+    
+    if not poster_id:
+        await callback.message.answer("Хатогӣ. Лутфан аз нав кӯшиш кунед.")
+        await callback.answer()
+        await state.clear()
+        return
+    
+    orders = db.get_poster_orders(poster_id)
+    
+    success = db.cancel_poster(poster_id)
+    
+    if success:
+        for order in orders:
+            if order['is_active']:
+                db.update_order_status(order['id'], 'cancelled', "Сафар аз ҷониби ронанда бекор карда шуд")
+                
+                db.save_notification(
+                    order['user_id'], 
+                    f"Сафари шумо аз {order['from_location']} ба {order['to_location']} бекор карда шуд.",
+                    "ride_cancelled",
+                    order['id']
+                )
+        
+        await callback.message.answer("✅ Сафар ва ҳамаи бронҳои он бо муваффақият бекор карда шуданд.")
+        
+        await show_driver_rides(callback.message, state)
+    else:
+        await callback.message.answer("❌ Хатогӣ ҳангоми бекор кардани сафар. Лутфан аз нав кӯшиш кунед.")
+    
+    await callback.answer()
+    await state.clear()
+
+@dp.callback_query(F.data == "cancel_cancel_ride")
+async def cancel_ride_abort(callback: CallbackQuery, state: FSMContext):
+    """Abort ride cancellation"""
+    data = await state.get_data()
+    poster_id = data.get("edit_poster_id")
+    
+    await edit_ride_menu(callback=SimpleNamespace(
+        data=f"edit_ride_{poster_id}", 
+        message=callback.message,
+        from_user=callback.from_user,
+        answer=lambda: None
+    ), state=state)
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_rides")
+async def back_to_rides(callback: CallbackQuery, state: FSMContext):
+    """Return to my rides menu"""
+    await show_driver_rides(callback.message, state)
+    await callback.answer()
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("view_passengers_"))
+async def view_passengers(callback: CallbackQuery, state: FSMContext):
+    """Show passengers for a ride"""
+    poster_id = int(callback.data.split("_")[2])
+    
+    poster = db.get_poster_by_id(poster_id)
+    if not poster:
+        await callback.message.answer("Сафар ёфт нашуд.")
+        await callback.answer()
+        return
+    
+    user_id = callback.from_user.id
+    db_user = db.get_user(user_id)
+    
+    if not db_user or db_user['id'] != poster['user_id']:
+        await callback.message.answer("Шумо ҳуқуқи дидани мусофирони ин сафарро надоред.")
+        await callback.answer()
+        return
+    
+    orders = db.get_poster_orders(poster_id)
+    
+    if not orders:
+        await callback.message.answer(
+            f"Барои сафари {poster['from_location']} - {poster['to_location']} ҳанӯз мусофирон нестанд.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Бозгашт", callback_data=f"edit_ride_{poster_id}")]
+            ])
+        )
+        await callback.answer()
+        return
+    
+    message_text = f"🧑‍🤝‍🧑 Мусофирон барои сафари {poster['from_location']} - {poster['to_location']}:\n\n"
+    
+    for order in orders:
+        message_text += f"👤 {order['first_name']} {order['last_name'] or ''}\n"
+        message_text += f"📱 {order['phone_number']}\n"
+        message_text += f"💺 Ҷойҳо: {order['seat_count']}\n"
+        message_text += f"🧳 Бор: {order['baggage_weight']} кг\n"
+        message_text += f"📝 Ҳолат: {get_status_text(order['status'])}\n"
+        
+        message_text += "\n"
+    
+    keyboard = []
+    
+    for i, order in enumerate(orders):
+        if order['status'] == 'pending':
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"✅ Тасдиқи {order['first_name']}", 
+                    callback_data=f"approve_order_{order['id']}"
+                )
+            ])
+    
+    for i, order in enumerate(orders):
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"💬 Чат бо {order['first_name']}", 
+                callback_data=f"chat_with_{order['user_id']}_{poster_id}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton(text="🔙 Бозгашт", callback_data=f"edit_ride_{poster_id}")])
+    
+    await callback.message.answer(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+    
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("approve_order_"))
+async def approve_order(callback: CallbackQuery, state: FSMContext):
+    """Approve a passenger's order"""
+    order_id = int(callback.data.split("_")[2])
+    
+    # Get order details
+    order = db.get_order_by_id(order_id)
+    if not order:
+        await callback.message.answer("Фармоиш ёфт нашуд.")
+        await callback.answer()
+        return
+    
+    user_id = callback.from_user.id
+    db_user = db.get_user(user_id)
+    
+    if not db_user or db_user['id'] != order['driver_user_id']:
+        await callback.message.answer("Шумо ҳуқуқи тасдиқ кардани ин фармоишро надоред.")
+        await callback.answer()
+        return
+    
+    success = db.update_order_status(order_id, 'approved')
+    
+    if success:
+        db.save_notification(
+            order['user_id'], 
+            f"Фармоиши шумо барои сафар аз {order['from_location']} ба {order['to_location']} тасдиқ карда шуд.",
+            "order_approved",
+            order_id
+        )
+        
+        await callback.message.answer("✅ Фармоиш бо муваффақият тасдиқ карда шуд.")
+        
+        await view_passengers(
+            callback=SimpleNamespace(
+                data=f"view_passengers_{order['poster_id']}", 
+                message=callback.message,
+                from_user=callback.from_user,
+                answer=lambda: None
+            ), 
+            state=state
+        )
+    else:
+        await callback.message.answer("❌ Хатогӣ ҳангоми тасдиқ кардани фармоиш. Лутфан аз нав кӯшиш кунед.")
+    
+    await callback.answer()
+
+@dp.message(Command("car_photo"))
+async def upload_car_photo_command(message: Message, state: FSMContext):
+    """Start process to upload car photo"""
+    user_id = message.from_user.id
+    db_user = db.get_user(user_id)
+    
+    if not db_user:
+        await message.answer("Шумо бояд аввал бақайд гиред. Лутфан /start -ро пахш кунед.")
+        return
+    
+    driver = db.get_driver_by_user_id(db_user['id'])
+    
+    if not driver:
+        await message.answer(
+            "Шумо ҳанӯз ронанда нестед. Барои бақайдгирӣ ҳамчун ронанда, /driver -ро пахш кунед."
+        )
+        return
+    
+    await message.answer(
+        "Лутфан аксеро, ки мехоҳед барои мошини худ истифода баред, фиристед:"
+    )
+    await state.set_state(DriverRegistration.uploading_car_photo)
+
+@dp.message(DriverRegistration.uploading_car_photo, F.photo)
+async def process_car_photo(message: Message, state: FSMContext):
+    """Process uploaded car photo"""
+    user_id = message.from_user.id
+    db_user = db.get_user(user_id)
+    driver = db.get_driver_by_user_id(db_user['id'])
+    
+    photo = message.photo[-1]
+    
+    file_id = photo.file_id
+    file = await bot.get_file(file_id)
+    file_path = file.file_path
+    
+    photo_filename = f"car_photos/car_{driver['id']}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+    downloaded_file = await bot.download_file(file_path, destination=photo_filename)
+    
+    db.update_driver_car_photo(driver['id'], photo_filename)
+    
+    await message.answer(
+        "✅ Акси мошин бо муваффақият боргузорӣ шуд! Акнун мусофирон метавонанд мошини шуморо бинанд."
+    )
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("send_location_"))
+async def send_location_to_driver(callback: CallbackQuery, state: FSMContext):
+    """Start process to send location to driver"""
+    data_parts = callback.data.split("_")
+    order_id = int(data_parts[2])
+    
+    order = db.get_order_by_id(order_id)
+    if not order:
+        await callback.message.answer("Фармоиш ёфт нашуд.")
+        await callback.answer()
+        return
+    
+    await state.update_data(location_order_id=order_id)
+    
+    await callback.message.answer(
+        f"Лутфан мавқеи ҷойгиршавии феълии худро ба ронанда ({order['first_name']}) фиристед.\n\n"
+        "Шумо метавонед:\n"
+        "1. Тугмаи 📎 (замима)-ро пахш кунед\n"
+        "2. 📍 Location-ро интихоб кунед\n"
+        "3. Мавқеи ҷойгиршавии худро фиристед",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Бозгашт", callback_data="cancel_location")]
+        ])
+    )
+    
+    await state.set_state(PassengerLocation.waiting_for_location)
+    await callback.answer()
+
+@dp.message(PassengerLocation.waiting_for_location, F.location)
+async def process_passenger_location(message: Message, state: FSMContext):
+    """Process passenger location"""
+    data = await state.get_data()
+    order_id = data.get("location_order_id")
+    
+    if not order_id:
+        await message.answer("Хатогӣ. Лутфан аз нав кӯшиш кунед.")
+        await state.clear()
+        return
+    
+    order = db.get_order_by_id(order_id)
+    if not order:
+        await message.answer("Фармоиш ёфт нашуд.")
+        await state.clear()
+        return
+    
+    latitude = message.location.latitude
+    longitude = message.location.longitude
+    
+    location_message = (
+        f"📍 Мавқеи ҷойгиршавии мусофир {message.from_user.first_name}:\n"
+        f"https://maps.google.com/maps?q={latitude},{longitude}"
+    )
+    
+    db.save_message(order['user_id'], order['driver_user_id'], order['poster_id'], location_message)
+    
+    await message.answer(
+        "✅ Мавқеи ҷойгиршавии шумо бо муваффақият ба ронанда фиристода шуд!"
+    )
+    
+    db.save_notification(
+        order['driver_user_id'],
+        f"Мусофир {message.from_user.first_name} мавқеи ҷойгиршавии худро фиристод.",
+        "new_location",
+        order_id
+    )
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "cancel_location", PassengerLocation.waiting_for_location)
+async def cancel_send_location(callback: CallbackQuery, state: FSMContext):
+    """Cancel sending location"""
+    await callback.message.answer("❌ Фиристодани мавқеи ҷойгиршавӣ бекор карда шуд.")
+    await callback.answer()
+    await state.clear()
+
+async def main():
+    db.setup_database()
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())

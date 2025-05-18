@@ -96,7 +96,7 @@ def setup_database():
     conn.close()
     print("Database setup completed!")
 
-    def create_connection():
+def create_connection():
     """Create a database connection to the SQLite database"""
     conn = sqlite3.connect('travel.db')
     conn.row_factory = sqlite3.Row 
