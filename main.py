@@ -972,3 +972,453 @@ async def cancel_booking_process(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("Брон бекор карда шуд.", reply_markup=get_main_keyboard())
     await state.clear()
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("passengers_"))
+async def show_passengers(callback: CallbackQuery):
+    poster_id = int(callback.data.split("_")[1])
+    passengers = db.get_poster_orders(poster_id)
+
+    if not passengers:
+        await callback.message.answer("Ҳоло ягон мусофир нест.")
+        await callback.answer()
+        return
+
+    for order in passengers:
+        await callback.message.answer(
+            f"👤 {order['first_name']} {order['last_name'] or ''}\n"
+            f"📞 {order['phone_number'] or 'Номаълум'}\n"
+            f"💺 Ҷойҳо: {order['seat_count']}\n"
+            f"🧳 Бор: {order['baggage_weight']} кг"
+        )
+    await callback.answer()
+
+
+
+@dp.message(F.text == "📜 Бронҳои Ман")
+async def view_my_bookings(message: Message):
+    """View user's bookings"""
+    user_id = message.from_user.id
+    db_user = db.get_user(user_id)
+    
+    if not db_user:
+        await message.answer("Лутфан аввал бақайдгирӣ гузаред.")
+        return
+    
+    orders = db.get_user_orders(db_user['id'])
+    
+    if not orders:
+        await message.answer("Шумо ҳоло ягон брон надоред.")
+        return
+    
+    for order in orders:
+        status_emoji = "✅" if order['status'] == 'confirmed' else "⏳" if order['status'] == 'pending' else "❌"
+        status_text = "Тасдиқшуда" if order['status'] == 'confirmed' else "Дар интизор" if order['status'] == 'pending' else "Бекоршуда"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="❌ Бекор кардан", callback_data=f"cancel_order_{order['id']}"),
+                InlineKeyboardButton(text="💬 Чат", callback_data=f"chat_{order['poster_id']}_{order['driver_id']}")
+            ],
+            [
+                InlineKeyboardButton(text="📍 Мавқеъ фиристодан", callback_data=f"send_location_{order['poster_id']}")
+            ]
+        ])
+        
+        await message.answer(
+            f"📜 Брон #{order['id']} {status_emoji} {status_text}\n\n"
+            f"🚏 Аз: {order['from_location']}\n"
+            f"🏁 Ба: {order['to_location']}\n"
+            f"🕒 Вақт: {format_datetime(order['time_to_go'])}\n"
+            f"💰 Нарх: {order['price'] * order['seat_count']} сомонӣ\n"
+            f"💺 Ҷойҳо: {order['seat_count']}\n"
+            f"🧳 Бор: {order['baggage_weight']} кг\n\n"
+            f"👨‍✈️ Ронанда: {order['driver_first_name']} {order['driver_last_name'] or ''}\n"
+            f"📞 Телефон: {order['driver_phone'] or 'Нишон дода нашудааст'}",
+            reply_markup=keyboard
+        )
+
+@dp.callback_query(F.data.startswith("cancel_order_"))
+async def cancel_order_prompt(callback: CallbackQuery, state: FSMContext):
+    """Prompt user for cancellation reason"""
+    order_id = int(callback.data.split("_")[2])
+    
+    await state.update_data(cancel_order_id=order_id)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Нақшаҳо тағйир ёфтанд", callback_data="cancel_reason_changed_plans")],
+        [InlineKeyboardButton(text="Бо роҳи дигар меравам", callback_data="cancel_reason_alternative_transport")],
+        [InlineKeyboardButton(text="Вақти сафар муносиб нест", callback_data="cancel_reason_inconvenient_time")],
+        [InlineKeyboardButton(text="Сабаби дигар", callback_data="cancel_reason_other")]
+    ])
+    
+    await callback.message.answer("Лутфан сабаби бекоркуниро интихоб кунед:", reply_markup=keyboard)
+    await state.set_state(CancelBooking.reason)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("cancel_reason_"), CancelBooking.reason)
+async def process_cancel_reason(callback: CallbackQuery, state: FSMContext):
+    """Process cancellation with selected reason"""
+    reason_code = callback.data.split("_")[2]
+    
+    reasons = {
+        "changed_plans": "Нақшаҳо тағйир ёфтанд",
+        "alternative_transport": "Бо роҳи дигар меравам",
+        "inconvenient_time": "Вақти сафар муносиб нест",
+        "other": "Сабаби дигар"
+    }
+    
+    reason = reasons.get(reason_code, "Сабаби дигар")
+    
+    data = await state.get_data()
+    order_id = data.get('cancel_order_id')
+    
+    if not order_id:
+        await callback.message.answer("Хатогӣ дар системаи бекоркунӣ. Лутфан боз кӯшиш кунед.")
+        await state.clear()
+        await callback.answer()
+        return
+    
+    order = db.get_order_by_id(order_id)
+    if not order:
+        await callback.message.answer("Брон ёфт нашуд.")
+        await state.clear()
+        await callback.answer()
+        return
+    
+    success = db.update_order_status(order_id, 'cancelled', reason)
+    
+    if success:
+        await callback.message.answer("✅ Брон бомуваффақият бекор карда шуд.")
+        
+        try:
+            driver_user_id = order.get('driver_user_id')
+            if driver_user_id:
+                driver_user = db.get_user_by_id(driver_user_id)
+                if driver_user and driver_user.get('telegram_id'):
+                    await bot.send_message(
+                        driver_user['telegram_id'],
+                        f"❌ Брон барои сафари шумо бекор карда шуд:\n\n"
+                        f"🚏 Аз: {order['from_location']}\n"
+                        f"🏁 Ба: {order['to_location']}\n"
+                        f"🕒 Вақт: {format_datetime(order['time_to_go'])}\n"
+                        f"👤 Мусофир: {order['first_name']} {order['last_name'] or ''}\n"
+                        f"💺 Ҷойҳо: {order['seat_count']}\n"
+                        f"❓ Сабаб: {reason}"
+                    )
+        except Exception as e:
+            logging.error(f"Error notifying driver about cancellation: {e}")
+    else:
+        await callback.message.answer("Хатогӣ ҳангоми бекоркунии брон. Лутфан боз кӯшиш кунед.")
+    
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("send_location_"))
+async def send_location_prompt(callback: CallbackQuery):
+    """Prompt user to send location"""
+    poster_id = callback.data.split("_")[2]
+    
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📍 Мавқеи худро фиристодан", request_location=True)],
+            [KeyboardButton(text="🔙 Бозгашт")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    
+    await callback.message.answer(
+        "Барои фиристодани мавқеи худ, тугмаи '📍 Мавқеи худро фиристодан'-ро пахш кунед.",
+        reply_markup=keyboard
+    )
+    
+    temp_data[f"location_{callback.from_user.id}"] = poster_id
+    await callback.answer()
+
+@dp.message(F.location)
+async def process_location(message: Message):
+    """Process shared location"""
+    user_id = message.from_user.id
+    poster_id_key = f"location_{user_id}"
+    
+    if poster_id_key not in temp_data:
+        await message.answer("Мавқеи шумо қабул нашуд. Лутфан аз нав кӯшиш кунед.", 
+                           reply_markup=get_main_keyboard())
+        return
+    
+    poster_id = temp_data[poster_id_key]
+    del temp_data[poster_id_key]  
+    
+    poster = db.get_poster_by_id(poster_id)
+    if not poster:
+        await message.answer("Сафар ёфт нашуд.", reply_markup=get_main_keyboard())
+        return
+    
+    db_user = db.get_user(user_id)
+    if not db_user:
+        await message.answer("Лутфан аввал бақайдгирӣ гузаред.", reply_markup=get_main_keyboard())
+        return
+    
+    try:
+        driver_user_id = poster.get('user_id')
+        driver_user = db.get_user_by_id(driver_user_id)
+        
+        if driver_user and driver_user.get('telegram_id'):
+            await bot.send_location(
+                driver_user['telegram_id'],
+                latitude=message.location.latitude,
+                longitude=message.location.longitude
+            )
+            
+            await bot.send_message(
+                driver_user['telegram_id'],
+                f"📍 Мусофир {message.from_user.full_name} мавқеи худро барои сафар аз {poster['from_location']} "
+                f"то {poster['to_location']} фиристод."
+            )
+            
+            await message.answer("✅ Мавқеи шумо ба ронанда фиристода шуд.", reply_markup=get_main_keyboard())
+        else:
+            await message.answer("Хатогӣ ҳангоми фиристодани мавқеъ. Ронанда дастрас нест.", 
+                               reply_markup=get_main_keyboard())
+    except Exception as e:
+        logging.error(f"Error sending location: {e}")
+        await message.answer("Хатогӣ ҳангоми фиристодани мавқеъ. Лутфан боз кӯшиш кунед.", 
+                           reply_markup=get_main_keyboard())
+
+@dp.callback_query(F.data.startswith("chat_"))
+async def open_chat(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    
+    if len(parts) < 3:
+        await callback.message.answer("❌ Callback-и нодуруст.")
+        await callback.answer()
+        return
+
+    poster_id = int(parts[1])
+    other_user_id = int(parts[2])  
+
+    db_user = db.get_user(callback.from_user.id)
+    if not db_user:
+        await callback.message.answer("Лутфан аввал бақайдгирӣ гузаред.")
+        await callback.answer()
+        return
+
+    other_user = db.get_user_by_id(other_user_id)  
+    if not other_user:
+        await callback.message.answer("Корбар ёфт нашуд.")
+        await callback.answer()
+        return
+
+    await state.update_data(
+        chat_with_user_id=other_user_id,
+        chat_poster_id=poster_id
+    )
+
+    messages = db.get_chat_messages(db_user['id'], other_user_id, poster_id)
+
+    if messages:
+        text = "💬 Чат:\n\n"
+        for msg in messages[-10:]:
+            prefix = "👤 Шумо: " if msg['sender_id'] == db_user['id'] else f"👤 {msg['sender_name']}: "
+            text += f"{prefix}{msg['message_text']}\n"
+        await callback.message.answer(text, reply_markup=get_exit_chat_keyboard())
+    else:
+        await callback.message.answer("💬 Чат оғоз шуд. Паёми худро нависед:", reply_markup=get_exit_chat_keyboard())
+
+    await state.set_state(ChatState.chatting)
+    await callback.answer()
+
+
+
+
+@dp.message(ChatState.chatting)
+async def process_chat_message(message: Message, state: FSMContext):
+    """Process chat messages"""
+    data = await state.get_data()
+    other_user_id = data.get('chat_with_user_id')
+    poster_id = data.get('chat_poster_id')
+    
+    if not other_user_id or not poster_id:
+        await message.answer("Хатогӣ дар системаи чат. Лутфан боз кӯшиш кунед.", 
+                           reply_markup=get_main_keyboard())
+        await state.clear()
+        return
+    
+    user_id = message.from_user.id
+    db_user = db.get_user(user_id)
+    
+    if not db_user:
+        await message.answer("Лутфан аввал бақайдгирӣ гузаред.", reply_markup=get_main_keyboard())
+        await state.clear()
+        return
+    
+    message_id = db.save_message(db_user['id'], other_user_id, poster_id, message.text)
+    
+    if message_id:
+        try:
+            other_user = db.get_user_by_id(other_user_id)
+            poster = db.get_poster_by_id(poster_id)
+            
+            if other_user and other_user.get('telegram_id') and poster:
+                await bot.send_message(
+                    other_user['telegram_id'],
+                    f"💬 Паём аз {db_user['first_name']} {db_user['last_name'] or ''}\n"
+                    f"Барои сафар: {poster['from_location']} - {poster['to_location']}\n\n"
+                    f"{message.text}\n\n"
+                    f"Барои ҷавоб додан, вориди чат шавед."
+                )
+        except Exception as e:
+            logging.error(f"Error forwarding message: {e}")
+    
+    await message.answer("✅ Паём фиристода шуд.")
+
+@dp.callback_query(F.data == "exit_chat", ChatState.chatting)
+async def exit_chat(callback: CallbackQuery, state: FSMContext):
+    """Exit from chat mode"""
+    await callback.message.answer("Шумо аз чат баромадед.", reply_markup=get_main_keyboard())
+    await state.clear()
+    await callback.answer()
+
+
+def get_exit_chat_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔚 Баромадан аз чат", callback_data="exit_chat")]
+        ]
+    )
+
+
+
+@dp.callback_query(F.data.startswith("edit_ride_")) 
+async def edit_ride_menu(callback: CallbackQuery, state: FSMContext):     
+    """Show edit options for a ride"""     
+    poster_id = int(callback.data.split("_")[2])          
+    
+    poster = db.get_poster_by_id(poster_id)     
+    if not poster:         
+        await callback.message.answer("Сафар ёфт нашуд.")         
+        await callback.answer()         
+        return          
+    
+    user_id = callback.from_user.id     
+    db_user = db.get_user(user_id)          
+    
+    if not db_user or db_user['id'] != poster['user_id']:         
+        await callback.message.answer("Шумо ҳуқуқи таҳрир кардани ин сафарро надоред.")         
+        await callback.answer()         
+        return          
+    
+    await state.update_data(edit_poster_id=poster_id)          
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[         
+        [InlineKeyboardButton(text="🕒 Вақт", callback_data="edit_time")],         
+        [InlineKeyboardButton(text="💰 Нарх", callback_data="edit_price")],         
+        [InlineKeyboardButton(text="💺 Шумораи ҷойҳо", callback_data="edit_seats")],         
+        [InlineKeyboardButton(text="🧳 Вазни бор (як кас)", callback_data="edit_bags")],         
+        [InlineKeyboardButton(text="❌ Бекор кардани сафар", callback_data="cancel_ride")],         
+        [InlineKeyboardButton(text="🔙 Бозгашт", callback_data="back_to_rides")]     
+    ])          
+    
+    await callback.message.answer(         
+        f"Таҳрири сафар: {poster['from_location']} - {poster['to_location']}\n"         
+        f"Вақт: {format_datetime(poster['time_to_go'])}\n"         
+        f"Нарх: {poster['price']} сомонӣ\n"         
+        f"Ҷойҳои холӣ: {poster['seat_count']}\n"         
+        f"Бағоҷи иҷозатдодашуда: {poster['bags_count']} дона\n\n"         
+        "Чиро таҳрир кардан мехоҳед?",         
+        reply_markup=keyboard     
+    )          
+    
+    await state.set_state(EditRide.waiting_for_field)     
+    await callback.answer()  
+
+@dp.callback_query(F.data == "edit_time", EditRide.waiting_for_field) 
+async def edit_time_start(callback: CallbackQuery, state: FSMContext):     
+    """Start editing time"""     
+    await callback.message.answer(         
+        "Лутфан вақти нави сафарро бо формати YYYY-MM-DD HH:MM ворид кунед:"     
+    )     
+    await state.set_state(EditRide.new_time)     
+    await callback.answer()
+
+@dp.message(EditRide.new_time)
+async def process_new_time(message: Message, state: FSMContext):
+    """Process new time for ride"""
+    try:
+        new_time = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
+        
+        data = await state.get_data()
+        poster_id = data.get("edit_poster_id")
+        
+        if not poster_id:
+            await message.answer("Хатогӣ. Лутфан аз нав кӯшиш кунед.")
+            await state.clear()
+            return
+        
+        success = db.update_poster(poster_id, time_to_go=new_time)
+        
+        if success:
+            db.create_notification_for_ride_changes(
+                poster_id, 
+                f"Вақти сафар тағйир дода шуд. Вақти нав: {new_time.strftime('%Y-%m-%d %H:%M')}"
+            )
+            
+            await message.answer("✅ Вақти сафар бо муваффақият тағйир дода шуд.")
+            await edit_ride_menu(callback=SimpleNamespace(
+                data=f"edit_ride_{poster_id}", 
+                message=message,
+                from_user=message.from_user,
+                answer=lambda: None
+            ), state=state)
+        else:
+            await message.answer("❌ Хатогӣ ҳангоми тағйир додани вақти сафар. Лутфан аз нав кӯшиш кунед.")
+            
+    except ValueError:
+        await message.answer("❌ Формати вақт нодуруст аст. Лутфан аз нав бо формати YYYY-MM-DD HH:MM ворид кунед:")
+
+@dp.callback_query(F.data == "edit_price", EditRide.waiting_for_field)
+async def edit_price_start(callback: CallbackQuery, state: FSMContext):
+    """Start editing price"""
+    await callback.message.answer("Лутфан нархи навро ворид кунед (бо сомонӣ):")
+    await state.set_state(EditRide.new_price)
+    await callback.answer()
+
+@dp.message(EditRide.new_price)
+async def process_new_price(message: Message, state: FSMContext):
+    """Process new price for ride"""
+    try:
+        new_price = float(message.text.strip())
+        
+        if new_price <= 0:
+            await message.answer("❌ Нарх бояд аз 0 зиёд бошад. Лутфан аз нав ворид кунед:")
+            return
+        
+        data = await state.get_data()
+        poster_id = data.get("edit_poster_id")
+        
+        if not poster_id:
+            await message.answer("Хатогӣ. Лутфан аз нав кӯшиш кунед.")
+            await state.clear()
+            return
+        
+        success = db.update_poster(poster_id, price=new_price)
+        
+        if success:
+            db.create_notification_for_ride_changes(
+                poster_id, 
+                f"Нархи сафар тағйир дода шуд. Нархи нав: {new_price} сомонӣ"
+            )
+            
+            await message.answer("✅ Нархи сафар бо муваффақият тағйир дода шуд.")
+            await edit_ride_menu(callback=SimpleNamespace(
+                data=f"edit_ride_{poster_id}", 
+                message=message,
+                from_user=message.from_user,
+                answer=lambda: None
+            ), state=state)
+        else:
+            await message.answer("❌ Хатогӣ ҳангоми тағйир додани нархи сафар. Лутфан аз нав кӯшиш кунед.")
+            
+    except ValueError:
+        await message.answer("❌ Лутфан қимати рақамиро ворид кунед:")
